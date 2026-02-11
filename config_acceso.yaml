@@ -1,0 +1,15 @@
+DWRAC:
+    entorno : Oracle
+    user : DWRAC
+    pwd : U3=Qni.9
+    server : 192.168.198.10
+    service : HINTD
+    database : 
+
+DURMG:
+    entorno : Oracle
+    user : DURMG
+    pwd : rodrigo9
+    server : 192.168.198.10
+    service : HINTD
+    database : 
