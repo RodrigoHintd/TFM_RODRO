@@ -10,6 +10,7 @@ pandas = ">=2.3.3,<3"
 sqlalchemy = ">=2.0.46,<3"
 pyyaml = ">=6.0.3,<7"
 oracledb = ">=3.4.2,<4"
+folium = ">=0.20.0,<0.21"
 
 [pypi-dependencies]
 ortools = "*"

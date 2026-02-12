@@ -4,6 +4,8 @@ from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 import pandas as pd
 from access_db import ConfiguracionConexion, AccessDB
+import folium
+import random
 
 #Obtenemos los datos
 def get_data_from_sql():
@@ -12,6 +14,8 @@ def get_data_from_sql():
     conn_config = ConfiguracionConexion(config_id="DWRAC", ruta='config_acceso.yaml')
     db = AccessDB(conn_config)
     
+
+    # Traemos distancias
     TABLA_RUTAS = "DWVEG_ORT.RMG_DIM_DISTANCIA"
     query = f"""
         SELECT LOC_ORIGEN, LOC_DESTINO, DISTANCIA_KM, TIEMPO_MIN, COMPATIBILIDAD_SN
@@ -27,6 +31,7 @@ def get_data_from_sql():
 
     all_nodes = pd.concat([df['LOC_ORIGEN'], df['LOC_DESTINO']]).unique()
     node_to_idx = {node: i for i, node in enumerate(all_nodes)}
+    idx_to_node = {i: node for node, i in node_to_idx.items()}
     num_nodes = len(all_nodes)
     
     df['idx_origen'] = df['LOC_ORIGEN'].map(node_to_idx)
@@ -46,20 +51,128 @@ def get_data_from_sql():
     time_pivot = time_pivot.reindex(index=all_idxs, columns=all_idxs, fill_value=PENALIZACION)
     time_matrix = time_pivot.fillna(PENALIZACION).round().astype(int).values.tolist()
     
+
+    # Traemos coordenadas 
+    TABLA_COORDS = "DWVEG_ORT.RMG_DIM_LOCALIZACION"  
+
+    query_coords = f"""
+        SELECT LOC_ID, LATITUD, LONGITUD
+        FROM {TABLA_COORDS}
+    """
+    df_coords = db.get_dataframe(query_coords)
+
+    node_coords = {}
+    for _, row in df_coords.iterrows():
+        node_id = row['LOC_ID']
+        if node_id in node_to_idx:
+            idx = node_to_idx[node_id]
+            node_coords[idx] = (row['LATITUD'], row['LONGITUD'])
+            
+    # Manejo de error si faltan coordenadas
+    for i in range(num_nodes):
+        if i not in node_coords:
+            print(f"⚠️ Advertencia: No se encontraron coordenadas para el nodo {i} ({idx_to_node[i]})")
+            node_coords[i] = (0.0, 0.0) # Valor por defecto
+
+
+
+
     print(f"✅ Matrices cargadas y reindexadas: {len(dist_matrix)} nodos.")
     
-    return dist_matrix, time_matrix, node_to_idx
+    return dist_matrix, time_matrix, node_to_idx, node_coords
+
+
+def generate_map(data, manager, routing, solution):
+    """Genera un mapa interactivo con iconos diferenciados para entregas y recogidas."""
+    # Centramos el mapa en el depósito
+    depot_coords = data['node_coords'][data['depot']]
+    m = folium.Map(location=depot_coords, zoom_start=12)
+
+    # Colores para distinguir los vehículos
+    colors = ['red', 'blue', 'green', 'purple', 'orange', 'darkred', 
+              'cadetblue', 'darkpurple', 'pink', 'lightblue', 'black']
+
+    for vehicle_id in range(data["num_vehicles"]):
+        index = routing.Start(vehicle_id)
+        route_coords = []
+        color = colors[vehicle_id % len(colors)]
+        
+        while not routing.IsEnd(index):
+            node_index = manager.IndexToNode(index)
+            coords = data['node_coords'][node_index]
+            route_coords.append(coords)
+            
+            # --- LÓGICA DE ICONOS DIFERENCIADOS ---
+            if node_index == data['depot']:
+                icon_type = 'home'
+                icon_color = 'black'
+                label = "DEPÓSITO"
+            elif node_index in data['delivery_nodes']:
+                icon_type = 'arrow-down' # Icono para entrega
+                icon_color = color
+                label = f"ENTREGA (Nodo {node_index})"
+            elif node_index in data['pickup_nodes']:
+                icon_type = 'arrow-up'   # Icono para recogida
+                icon_color = color
+                label = f"RECOGIDA (Nodo {node_index})"
+            else:
+                icon_type = 'info-sign'
+                icon_color = color
+                label = f"Nodo {node_index}"
+
+            # Añadir el marcador al mapa
+            folium.Marker(
+                location=coords, 
+                popup=f"{label}<br>Vehículo: {vehicle_id}", 
+                icon=folium.Icon(color=icon_color, icon=icon_type, prefix='fa') # Usamos FontAwesome
+            ).add_to(m)
+            
+            index = solution.Value(routing.NextVar(index))
+        
+        # Añadir el regreso al depósito a la línea de la ruta
+        node_index = manager.IndexToNode(index)
+        route_coords.append(data['node_coords'][node_index])
+        
+        # Dibujar la línea de la ruta
+        if len(route_coords) > 2:
+            folium.PolyLine(
+                route_coords, 
+                color=color, 
+                weight=3, 
+                opacity=0.7,
+                tooltip=f"Ruta Vehículo {vehicle_id}"
+            ).add_to(m)
+
+    # Guardar el mapa
+    m.save("mapa_rutas.html")
+    print("✅ Mapa generado con iconos diferenciados: abre 'mapa_rutas.html'")
+
+
+
+
+
+
+
+
+
 
 
 def create_data_model():
     """Define los datos del problema."""
     data = {}
     
-    dist_matrix, time_matrix, node_to_idx = get_data_from_sql()
+    dist_matrix, time_matrix, node_to_idx, node_coords = get_data_from_sql()
     
-    #NNumero de nodos
+    #Numero de nodos
     num_nodes = len(dist_matrix)
     data['node_to_idx'] = node_to_idx
+
+
+    #Matriz coordenadas de nodos
+    
+    data['node_coords'] = node_coords
+
+
 
     # Matriz de distancias entre nodos
     data["distance_matrix"] = dist_matrix
@@ -80,7 +193,7 @@ def create_data_model():
         else:
             demands[i] = 1            # RECOGIDA: El camión suma carga
             pickup_nodes.append(i)
-    
+   
     data["demands"] = demands
     # Definimos que nodos son las entregas y cuales son las recogidas
     data["delivery_nodes"] = delivery_nodes
@@ -214,8 +327,8 @@ def main():
     
     if solution:
         print_solution(data, manager, routing, solution)
+        generate_map(data, manager, routing, solution) # <--- AÑADIR ESTO
     else:
         print("⚠ No se encontró solución.")
-
 if __name__ == "__main__":
     main()
