@@ -6,6 +6,7 @@ import pandas as pd
 from access_db import ConfiguracionConexion, AccessDB
 import folium
 import random
+import numpy as np
 
 #Obtenemos los datos
 def get_data_from_sql():
@@ -14,7 +15,6 @@ def get_data_from_sql():
     conn_config = ConfiguracionConexion(config_id="DWRAC", ruta='config_acceso.yaml')
     db = AccessDB(conn_config)
     
-
     # Traemos distancias
     TABLA_RUTAS = "DWVEG_ORT.RMG_DIM_DISTANCIA"
     query = f"""
@@ -24,7 +24,7 @@ def get_data_from_sql():
     df = db.get_dataframe(query)
     
     # Penalización alta para caminos no compatibles o inexistentes
-    PENALIZACION = 100000
+    PENALIZACION = 5000000
 
     if df.empty:
         raise Exception(f"La tabla {TABLA_RUTAS} está vacía.")
@@ -40,18 +40,21 @@ def get_data_from_sql():
     # Aplicamos la restricción de compatibilidad
     df.loc[df['COMPATIBILIDAD_SN'] == 'N', ['DISTANCIA_KM', 'TIEMPO_MIN']] = PENALIZACION
 
-    # Creamos las matrices asegurando que sean de tamaño N x N (reindex)
+    # Creamos las matrices asegurando que sean de tamaño N x N
     all_idxs = list(range(num_nodes))
     
     dist_pivot = df.pivot(index='idx_origen', columns='idx_destino', values='DISTANCIA_KM')
     dist_pivot = dist_pivot.reindex(index=all_idxs, columns=all_idxs, fill_value=PENALIZACION)
-    dist_matrix = dist_pivot.fillna(PENALIZACION).round().astype(int).values.tolist()
+    dist_matrix = dist_pivot.fillna(PENALIZACION).values
+    np.fill_diagonal(dist_matrix, 0) 
+    dist_matrix = dist_matrix.round().astype(int).tolist()
 
     time_pivot = df.pivot(index='idx_origen', columns='idx_destino', values='TIEMPO_MIN')
     time_pivot = time_pivot.reindex(index=all_idxs, columns=all_idxs, fill_value=PENALIZACION)
-    time_matrix = time_pivot.fillna(PENALIZACION).round().astype(int).values.tolist()
+    time_matrix = time_pivot.fillna(PENALIZACION).values
+    np.fill_diagonal(time_matrix, 0) 
+    time_matrix = time_matrix.round().astype(int).tolist()
     
-
     # Traemos coordenadas 
     TABLA_COORDS = "DWVEG_ORT.RMG_DIM_LOCALIZACION"  
 
@@ -68,23 +71,12 @@ def get_data_from_sql():
             idx = node_to_idx[node_id]
             node_coords[idx] = (row['LATITUD'], row['LONGITUD'])
             
-    # Manejo de error si faltan coordenadas
-    for i in range(num_nodes):
-        if i not in node_coords:
-            print(f"⚠️ Advertencia: No se encontraron coordenadas para el nodo {i} ({idx_to_node[i]})")
-            node_coords[i] = (0.0, 0.0) # Valor por defecto
-
-
-
-
-    print(f"✅ Matrices cargadas y reindexadas: {len(dist_matrix)} nodos.")
-    
     return dist_matrix, time_matrix, node_to_idx, node_coords
 
 
 def generate_map(data, manager, routing, solution):
     """Genera un mapa interactivo con iconos diferenciados para entregas y recogidas."""
-    # Centramos el mapa en el depósito
+    # Centramos el mapa en Sigüeiro
     depot_coords = data['node_coords'][data['depot']]
     m = folium.Map(location=depot_coords, zoom_start=12)
 
@@ -102,22 +94,22 @@ def generate_map(data, manager, routing, solution):
             coords = data['node_coords'][node_index]
             route_coords.append(coords)
             
-            # --- LÓGICA DE ICONOS DIFERENCIADOS ---
+            #  ICONOS DIFERENCIADOS EN EL MAPA
             if node_index == data['depot']:
                 icon_type = 'home'
                 icon_color = 'black'
                 label = "DEPÓSITO"
             elif node_index in data['delivery_nodes']:
-                icon_type = 'arrow-down' # Icono para entrega
+                icon_type = 'arrow-down' 
                 icon_color = color
                 label = f"ENTREGA (Nodo {node_index})"
             elif node_index in data['pickup_nodes']:
-                icon_type = 'arrow-up'   # Icono para recogida
+                icon_type = 'arrow-up'   
                 icon_color = color
                 label = f"RECOGIDA (Nodo {node_index})"
             else:
-                icon_type = 'info-sign'
-                icon_color = color
+                icon_type = 'ban' 
+                icon_color = 'gray'
                 label = f"Nodo {node_index}"
 
             # Añadir el marcador al mapa
@@ -148,64 +140,63 @@ def generate_map(data, manager, routing, solution):
     print("✅ Mapa generado con iconos diferenciados: abre 'mapa_rutas.html'")
 
 
-
-
-
-
-
-
-
-
-
 def create_data_model():
     """Define los datos del problema."""
     data = {}
     
     dist_matrix, time_matrix, node_to_idx, node_coords = get_data_from_sql()
     
+    #Estableciendo Sgüeiro como base
+    NODO_BASE = "A00010"
+    if NODO_BASE not in node_to_idx:
+        raise Exception(f"CRÍTICO: El nodo base {NODO_BASE} no está en los datos.")
+    indice_base = node_to_idx[NODO_BASE]
+
     #Numero de nodos
     num_nodes = len(dist_matrix)
     data['node_to_idx'] = node_to_idx
 
-
     #Matriz coordenadas de nodos
-    
     data['node_coords'] = node_coords
-
-
 
     # Matriz de distancias entre nodos
     data["distance_matrix"] = dist_matrix
 
     # Matriz de tiempos
     data["time_matrix"] = time_matrix
+    
+    #Establecemos el nodo base
+    data["depot"] = indice_base
 
     # Cantidad de carga a depositar en cada entrega.
-    mitad = num_nodes // 2
     demands = [0] * num_nodes
     delivery_nodes = []
     pickup_nodes = []
 
-    for i in range(1, num_nodes):
-        if i <= mitad:
-            demands[i] = -1           # ENTREGA: El camión suelta carga
-            delivery_nodes.append(i)
+    # Identificamos todos los nodos que NO son el depósito
+    nodos_clientes = [i for i in range(num_nodes) if i != indice_base]
+    mitad_clientes = len(nodos_clientes) // 2
+    
+    # Asignamos roles solo a clientes, nunca al depósito
+    for i, nodo_idx in enumerate(nodos_clientes):
+        if i < mitad_clientes:
+            demands[nodo_idx] = -1          # ENTREGA: El camión suelta carga
+            delivery_nodes.append(nodo_idx)
         else:
-            demands[i] = 1            # RECOGIDA: El camión suma carga
-            pickup_nodes.append(i)
+            demands[nodo_idx] = 1           # RECOGIDA: El camión suma carga
+            pickup_nodes.append(nodo_idx)
    
     data["demands"] = demands
     # Definimos que nodos son las entregas y cuales son las recogidas
     data["delivery_nodes"] = delivery_nodes
     data["pickup_nodes"] = pickup_nodes
 
-    # Capacidades de los vehículos (Definimos num_vehicles ANTES para evitar KeyError)
+    # Capacidades de los vehículos
     data["num_vehicles"] = 15
     data["vehicle_capacities"] = [100] * data["num_vehicles"]
     
-    # Ventanas de tiempo (Aumentamos el rango para permitir penalizaciones si es necesario)
-    data["time_windows"] = [(0, 1000000)] * num_nodes
-    data["depot"] = 0
+    # Ventanas de tiempo
+    data["time_windows"] = [(0, 2000000)] * num_nodes
     
     return data
 
@@ -219,8 +210,10 @@ def print_solution(data, manager, routing, solution):
         index = routing.Start(vehicle_id)
         plan_output = f"Ruta vehículo {vehicle_id}:\n"
         route_distance = 0
+        nodes_visited = 0
         
         while not routing.IsEnd(index):
+            nodes_visited += 1
             node_index = manager.IndexToNode(index)
             load_var = solution.Value(capacity_dimension.CumulVar(index))
             time_var = solution.Value(time_dimension.CumulVar(index))
@@ -236,7 +229,8 @@ def print_solution(data, manager, routing, solution):
         plan_output += f"{manager.IndexToNode(index)}(Carga={load_var}, Tiempo={time_var})\n"
         plan_output += f"Distancia de la ruta: {route_distance}m\n"
         
-        if route_distance > 0:
+        # Solo imprimimos si el vehículo salió del depósito (distancia > 0 o visitó más de 1 nodo)
+        if nodes_visited > 1:
             print(plan_output)
             total_distance += route_distance
             
@@ -245,9 +239,9 @@ def print_solution(data, manager, routing, solution):
 def main():
     data = create_data_model()
     
-    manager = pywrapcp.RoutingIndexManager(len(data["distance_matrix"]),
-                                           data["num_vehicles"],
-                                           data["depot"])
+    manager = pywrapcp.RoutingIndexManager(len(data["distance_matrix"]), data["num_vehicles"],
+                                           data["depot"]
+                                           )
     
     routing = pywrapcp.RoutingModel(manager)
     
@@ -283,10 +277,11 @@ def main():
         return data["time_matrix"][manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
     
     time_callback_index = routing.RegisterTransitCallback(time_callback)
+    
     routing.AddDimension(
         time_callback_index,
-        60,        # slack permitido (margen de espera)
-        1000000,   # tiempo máximo (Aumentado para absorber penalizaciones de compatibilidad)
+        1440,        # slack permitido
+        50000000,   # tiempo máximo (Aumentado a 50M)
         False,
         "Time"
     )
@@ -297,7 +292,7 @@ def main():
         index = manager.NodeToIndex(node_index)
         time_dimension.CumulVar(index).SetRange(start, end)
 
-    # REGLA: Forzar Entregas antes que Recogidas (Evitar Pickup -> Delivery)
+    #Forzar Entregas antes que Recogidas (Evitar Pickup -> Delivery)
     def pickup_count_callback(from_index):
         node = manager.IndexToNode(from_index)
         return 1 if node in data["pickup_nodes"] else 0
@@ -311,24 +306,31 @@ def main():
         sequence_dimension.CumulVar(d_index).SetMax(0)
 
     # Añadimos penalizaciones para permitir omitir nodos si son imposibles de alcanzar
-    penalty = 1000000 
-    for node in range(1, len(data["distance_matrix"])):
-        routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
+    penalty = 100000
+    for node in range(0, len(data["distance_matrix"])):
+        if node != data["depot"]:
+            routing.AddDisjunction([manager.NodeToIndex(node)], penalty)
 
     # Estrategia inicial de búsqueda
     search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    
+
     search_parameters.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION)
+        routing_enums_pb2.FirstSolutionStrategy.PATH_MOST_CONSTRAINED_ARC)
+    
     search_parameters.local_search_metaheuristic = (
         routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH)
+    
     search_parameters.time_limit.seconds = 30
     
     solution = routing.SolveWithParameters(search_parameters)
     
     if solution:
+        print("✅ SOLUCIÓN ENCONTRADA")
         print_solution(data, manager, routing, solution)
-        generate_map(data, manager, routing, solution) # <--- AÑADIR ESTO
+        generate_map(data, manager, routing, solution) 
     else:
         print("⚠ No se encontró solución.")
+        
 if __name__ == "__main__":
     main()
